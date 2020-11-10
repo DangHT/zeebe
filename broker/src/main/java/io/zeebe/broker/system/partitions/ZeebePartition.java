@@ -22,6 +22,8 @@ import io.zeebe.util.health.HealthStatus;
 import io.zeebe.util.sched.Actor;
 import io.zeebe.util.sched.future.ActorFuture;
 import io.zeebe.util.sched.future.CompletableActorFuture;
+import java.io.File;
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
@@ -33,7 +35,7 @@ public final class ZeebePartition extends Actor
     implements RaftRoleChangeListener, HealthMonitorable, FailureListener, DiskSpaceUsageListener {
 
   private static final Logger LOG = Loggers.SYSTEM_LOGGER;
-
+  private static final String PERSISTED_PAUSE_STATE_FILENAME = ".paused";
   private Role raftRole;
 
   private final String actorName;
@@ -54,6 +56,7 @@ public final class ZeebePartition extends Actor
 
     context.setActor(actor);
     context.setDiskSpaceAvailable(true);
+    initProcessingStatus();
 
     actorName = buildActorName(context.getNodeId(), "ZeebePartition-" + context.getPartitionId());
     context.setComponentHealthMonitor(new CriticalComponentsHealthMonitor(actor, LOG));
@@ -332,11 +335,16 @@ public final class ZeebePartition extends Actor
     final CompletableActorFuture<Void> completed = new CompletableActorFuture<>();
     actor.call(
         () -> {
-          context.setProcessingPaused(true);
-          if (context.getStreamProcessor() != null) {
-            context.getStreamProcessor().pauseProcessing().onComplete(completed);
-          } else {
-            completed.complete(null);
+          try {
+            getPersistedPauseState().createNewFile();
+            context.setProcessingPaused(true);
+            if (context.getStreamProcessor() != null) {
+              context.getStreamProcessor().pauseProcessing().onComplete(completed);
+            } else {
+              completed.complete(null);
+            }
+          } catch (final IOException e) {
+            completed.completeExceptionally(e);
           }
         });
     return completed;
@@ -345,11 +353,29 @@ public final class ZeebePartition extends Actor
   public void resumeProcessing() {
     actor.call(
         () -> {
-          context.setProcessingPaused(false);
-          if (context.getStreamProcessor() != null && context.shouldProcess()) {
-            context.getStreamProcessor().resumeProcessing();
+          final var persistedState = getPersistedPauseState();
+          persistedState.delete();
+          if (!persistedState.exists()) {
+            context.setProcessingPaused(false);
+            if (context.getStreamProcessor() != null && context.shouldProcess()) {
+              context.getStreamProcessor().resumeProcessing();
+            }
           }
         });
+  }
+
+  private File getPersistedPauseState() {
+    return context
+        .getRaftPartition()
+        .dataDirectory()
+        .toPath()
+        .resolve(PERSISTED_PAUSE_STATE_FILENAME)
+        .toFile();
+  }
+
+  private void initProcessingStatus() {
+    final boolean pauseProcessing = getPersistedPauseState().exists();
+    context.setProcessingPaused(pauseProcessing);
   }
 
   public int getPartitionId() {
